@@ -1,164 +1,260 @@
 # IoT Telemetry Service
 
-A lightweight C++ HTTP service that ingests IoT device telemetry and persists it to PostgreSQL. Built with [Crow](https://crowcpp.org/) (HTTP), [nlohmann/json](https://github.com/nlohmann/json) (validation/parsing), and [libpqxx](https://github.com/jtv/libpqxx) (PostgreSQL access).
+**A memory-safe C++ backend for ingesting IoT device telemetry — containerized, network-isolated, and continuously verified by an automated DevSecOps pipeline.**
 
-This was built and verified end-to-end (compiled, linked, run against a live PostgreSQL instance, and exercised with valid/invalid/malformed/adversarial payloads) as part of putting this together.
+![Security Scan](https://github.com/Soakar2/iot-telemetry-service/actions/workflows/security-scan.yml/badge.svg)
+![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
+![Docker](https://img.shields.io/badge/Docker-multi--stage-2496ED)
 
-## API
+---
 
-### `POST /api/v1/telemetry`
+## Overview
 
-```json
-{
-  "device_id": "sensor-001",
-  "timestamp": "2026-09-09T12:34:56Z",
-  "temperature": 23.5,
-  "location": { "lat": 40.7128, "lon": -74.0060 }
-}
+This service accepts IoT sensor readings over HTTP, validates them, and persists them to PostgreSQL. It's built with [Crow](https://crowcpp.org/) (HTTP), [nlohmann/json](https://github.com/nlohmann/json) (validation), and [libpqxx](https://github.com/jtv/libpqxx) (database access).
+
+What makes this project worth reading, though, isn't the telemetry endpoint itself — it's everything wrapped around it. Every layer was built with security as a design constraint, not a bolt-on: a multi-stage build that ships zero compiler tooling, a container that runs as an unprivileged user on a network-isolated backend, and a CI/CD pipeline that scans every single commit for leaked secrets and CVEs before it can reach `main`.
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Security Features](#security-features)
+- [API Reference](#api-reference)
+- [Project Structure](#project-structure)
+- [Local Setup](#local-setup)
+- [Running Security Scans Locally](#running-security-scans-locally)
+
+---
+
+## Architecture
+
+The system is built in four distinct layers, each one narrowing what the next layer is allowed to trust.
+
+```mermaid
+flowchart LR
+    A["C++ Source<br/>Crow + nlohmann/json + libpqxx"] --> B["Builder Stage<br/>debian:bookworm"]
+    B -->|copy compiled binary only| C["Runtime Stage<br/>debian:bookworm-slim, non-root"]
+    C --> D["telemetry-service container"]
+    D <-->|internal network| E[("PostgreSQL")]
+    D -->|public network| F["localhost:8080"]
 ```
 
-| Status | Meaning |
-|---|---|
-| `201` | Reading validated and persisted. Returns `{"status":"accepted","device_id":"..."}`. |
-| `400` | Malformed JSON or a failed validation rule. Returns `{"error":"..."}` describing the first problem found. |
-| `500` | Payload was valid but the database write failed. |
+```mermaid
+flowchart LR
+    A["Push or Pull Request"] --> B["TruffleHog<br/>secret scan"]
+    B --> C["docker build"]
+    C --> D["Trivy<br/>HIGH/CRITICAL gate"]
+    D -->|vulnerabilities found| E["Block"]
+    D -->|clean| F["Pass"]
+```
 
-### `GET /healthz`
+| Layer | Lives in | Responsibility |
+|---|---|---|
+| **Application** | `src/`, `include/` | HTTP routing, JSON validation, database access |
+| **Build** | `Dockerfile` (builder stage) | Compiles the binary; never ships |
+| **Container / Orchestration** | `Dockerfile` (runtime stage), `docker-compose.yml` | Runs the binary with minimal privilege, wires it to Postgres |
+| **CI/CD** | `.github/workflows/security-scan.yml` | Re-verifies every layer above on every commit |
 
-Returns `{"status":"ok"}` — for load balancer / container health checks.
+### Application layer
 
-## Project layout
+The C++ source is deliberately split so each piece can be reasoned about (and tested) independently:
+
+- **`main.cpp`** — Crow routes (`GET /healthz`, `POST /api/v1/telemetry`) and the glue between validation, the connection pool, and the database insert.
+- **`Config.hpp`** — Reads all configuration from environment variables and **throws at startup** if anything required is missing. The process never opens a listening socket with a bad or default credential.
+- **`ConnectionPool.hpp`** — A small thread-safe RAII pool of `pqxx::connection`s. Crow serves requests from multiple worker threads, and a `pqxx::connection` isn't safe to share across threads — this hands each request its own connection and guarantees it's returned even if the request throws.
+- **`TelemetryPayload.hpp`** — Validates every field's presence, type, and physical plausibility (e.g. latitude within ±90°) before anything touches SQL. Has zero dependency on Crow or libpqxx, so it's trivially unit-testable in isolation.
+
+### Build layer: multi-stage compilation
+
+The `Dockerfile` has two stages that never touch each other's contents beyond one explicit `COPY`:
+
+```dockerfile
+FROM debian:bookworm AS builder      # full compiler toolchain
+# ... cmake, git, build-essential, libpq-dev, libasio-dev ...
+# ... CMake FetchContent pulls pinned versions of Crow, nlohmann/json, libpqxx ...
+# ... compiles + strips the binary ...
+
+FROM debian:bookworm-slim AS runtime  # nothing from the line above
+COPY --from=builder /build/build/telemetry_service ./telemetry_service
+```
+
+Builder and runtime are pinned to the **same Debian release** on purpose — mixing distro families (e.g. an Ubuntu builder with a Debian runtime) risks a glibc version mismatch that crashes the binary at container startup with a cryptic `GLIBC_2.NN not found` error. Same release, same C library ABI, guaranteed compatible.
+
+### Container layer: docker-compose
+
+Two services, two networks:
+
+| Service | Image | Network(s) | Exposed to host? |
+|---|---|---|---|
+| `telemetry-service` | built from local `Dockerfile` | `public`, `backend` | Yes — port 8080 |
+| `db` | `postgres:16-alpine` | `backend` only | **No** |
+
+The `backend` network is marked `internal: true` — it has no route to the outside world. `db` has no `ports:` entry at all. The database is reachable *only* from the app container, over a network that itself can't reach the internet.
+
+### CI/CD layer
+
+`.github/workflows/security-scan.yml` runs the same two gates automatically, on every pull request and every push to `main`. See [Security Features](#security-features) below for exactly what each gate checks.
+
+---
+
+## Tech Stack
+
+| Component | Technology | Version |
+|---|---|---|
+| HTTP framework | [Crow](https://crowcpp.org/) | v1.3.4 |
+| JSON validation | [nlohmann/json](https://github.com/nlohmann/json) | v3.12.0 |
+| PostgreSQL client | [libpqxx](https://github.com/jtv/libpqxx) | 7.10.7 (C++17 line — see note in `CMakeLists.txt`) |
+| Database | PostgreSQL | 16 (Alpine) |
+| Language standard | C++ | 17 |
+| Build system | CMake | 3.16+ |
+| Container runtime | Docker / Docker Compose | — |
+| Secret scanning | [TruffleHog](https://github.com/trufflesecurity/trufflehog) | 3.x |
+| Vulnerability scanning | [Trivy](https://trivy.dev/) | pinned via CI (see below) |
+| CI/CD | GitHub Actions | — |
+
+---
+
+## Security Features
+
+### Attack-surface reduction via multi-stage build
+
+The image that's actually exposed to the network carries almost none of the tooling used to build it:
+
+| | Builder stage | Runtime stage |
+|---|---|---|
+| Base image | `debian:bookworm` | `debian:bookworm-slim` |
+| Compiler / build tools | gcc, g++, cmake, git, make (~87 packages) | **none** |
+| Source code | Full tree | **none** |
+| Installed packages | Full C++ toolchain + headers | `libpq5`, `ca-certificates`, `bash` only |
+| What ships | Nothing — discarded after build | Just the stripped binary |
+
+If the running container is ever compromised, there's no compiler on hand to build further exploit tooling in place, no source tree to leak, and a dramatically smaller package surface for CVEs to accumulate against. The binary itself is stripped of debug symbols during the build (`strip build/telemetry_service`) to reduce both image size and the information handed to anyone who obtains a copy.
+
+### Non-root execution
+
+- A dedicated system user (`telemetry`) owns and runs the process — no login shell (`/usr/sbin/nologin`), no password, no home directory.
+- The binary and health-check script are `chmod 550` (owner and group can read/execute; no write access for anyone, no access at all for others).
+- `USER telemetry` drops privileges *before* `ENTRYPOINT` runs.
+- At the orchestration level, `docker-compose.yml` adds further defense in depth: `cap_drop: [ALL]` (zero Linux capabilities — this service does no privileged binding or raw networking), `security_opt: no-new-privileges:true`, and a **read-only root filesystem** (the container can't write to its own image layer at all).
+
+### Secret scanning
+
+Two layers, same underlying tool:
+
+- **Locally (`scan.sh`)** — a pre-push gate that scans the working directory with TruffleHog before you ever push. Vendored build dependencies (`build/`) are explicitly excluded from the scan (`.trufflehog-exclude.txt`) — scanning a third-party library's own git history for "your" secrets is pure noise and a source of false positives.
+- **In CI** — TruffleHog runs on every PR and push, scanning the *actual commit diff* (correct `base`/`head` refs are chosen per event type, since using the wrong ref pair causes TruffleHog to silently scan nothing).
+- `--results=verified,unknown` is used in both places — this reports live-verified credentials **and** high-confidence matches TruffleHog couldn't actively verify (e.g. no network path to check them), not just the subset it could conclusively confirm.
+- **Architectural backstop:** even if a scanner ever missed something, `Config.hpp` only ever reads secrets from environment variables — there is no code path in this project where a real credential could be hardcoded in the first place.
+
+### CVE vulnerability gating
+
+- Trivy scans the **actual built runtime image** — not source code, not the Dockerfile in the abstract, the real artifact that would ship.
+- `--severity HIGH,CRITICAL` — only these two levels are reported or gated on; LOW/MEDIUM findings exist in the image but don't block anything.
+- `--ignore-unfixed` — vulnerabilities with no available patch yet are excluded from the gate, so it reflects "is there something actionable right now," not "does a CVE exist somewhere with no fix."
+- In CI, the official `aquasecurity/trivy-action` is pinned to a **specific commit SHA**, not a version tag — deliberately. In March 2026, a real supply-chain attack force-pushed 76 of 77 version tags of this exact action to credential-stealing malware ([GHSA-69fq-xp46-6x23](https://github.com/aquasecurity/trivy/security/advisories/GHSA-69fq-xp46-6x23)). The pinned commit corresponds to `v0.35.0`, the version explicitly named safe in the advisory — pinning to the commit itself means this workflow can't be silently repointed at a compromised release even if a tag were hijacked again.
+
+### Additional hardening
+
+- **SQL injection prevention** — every database write uses `pqxx::params` with bound parameters, never string concatenation. Verified directly: a `device_id` containing `"; DROP TABLE telemetry_readings;--"` was sent to the live endpoint and stored as an inert string, table intact.
+- **Compiler hardening** — `-Wall -Wextra -Wpedantic -fstack-protector-strong`, plus `_FORTIFY_SOURCE=2` in Release builds.
+- **Dependency-free health checks** — the container health check uses bash's built-in `/dev/tcp` to make a real HTTP request, rather than installing `curl`/`wget` into the minimal runtime image purely for that purpose.
+- **Least-privilege CI permissions** — the GitHub Actions workflow declares `permissions: contents: read` explicitly; it has no ability to write packages, comment on PRs, or touch anything beyond reading the repo.
+
+---
+
+## API Reference
+
+| Method | Path | Description | Success |
+|---|---|---|---|
+| `GET` | `/healthz` | Liveness check | `200` `{"status":"ok"}` |
+| `POST` | `/api/v1/telemetry` | Submit a telemetry reading | `201` `{"status":"accepted","device_id":"..."}` |
+
+**Example request:**
+
+```bash
+curl -X POST http://localhost:8080/api/v1/telemetry \
+  -H "Content-Type: application/json" \
+  -d '{
+    "device_id": "sensor-001",
+    "timestamp": "2026-09-09T12:34:56Z",
+    "temperature": 23.5,
+    "location": { "lat": 40.7128, "lon": -74.0060 }
+  }'
+```
+
+Malformed JSON or a failed validation rule (missing field, wrong type, out-of-range coordinate) returns `400` with `{"error": "..."}` describing the first problem found.
+
+---
+
+## Project Structure
 
 ```
 .
-├── CMakeLists.txt
-├── src/main.cpp                 # HTTP routes, wiring, DB insert
-├── include/Config.hpp           # env-var based configuration (fail-fast)
-├── include/ConnectionPool.hpp   # thread-safe RAII pqxx connection pool
-├── include/TelemetryPayload.hpp # JSON validation + parsing, no HTTP/DB deps
-├── sql/schema.sql               # table + index for telemetry_readings
-└── .env.example                 # documents required env vars (no real secrets)
+├── .github/workflows/security-scan.yml  # CI: TruffleHog + Trivy on every PR/push
+├── src/main.cpp                         # HTTP routes, wiring, DB insert
+├── include/
+│   ├── Config.hpp                       # Env-var config, fail-fast
+│   ├── ConnectionPool.hpp               # Thread-safe RAII pqxx pool
+│   └── TelemetryPayload.hpp             # JSON validation, framework-independent
+├── sql/schema.sql                       # telemetry_readings table + index
+├── Dockerfile                           # Multi-stage: builder -> minimal runtime
+├── docker-compose.yml                   # App + Postgres, isolated networks, health checks
+├── healthcheck.sh                       # Dependency-free bash /dev/tcp health probe
+├── scan.sh                              # Local pre-push security gate
+├── .trufflehog-exclude.txt              # Vendored-dependency exclusions for secret scanning
+├── CMakeLists.txt                       # FetchContent-based build, pinned dependency versions
+└── .env.example                         # Documents required environment variables
 ```
 
-Keeping validation, DB pooling, and config loading in separate headers (rather than one large `main.cpp`) means each piece can be unit-tested or swapped independently — e.g. the validation logic in `TelemetryPayload.hpp` has zero dependency on Crow or libpqxx.
+---
 
-## Running with Docker Compose
+## Local Setup
 
-The fastest way to run this end-to-end — no local C++ toolchain or PostgreSQL install needed:
+**Prerequisite:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running.
 
 ```bash
-cp .env.example .env   # then edit DB_NAME / DB_USER / DB_PASSWORD to real values
+# 1. Clone the repository
+git clone https://github.com/Soakar2/iot-telemetry-service.git
+cd iot-telemetry-service
+
+# 2. Configure environment variables
+cp .env.example .env
+# edit .env: set real values for DB_NAME, DB_USER, DB_PASSWORD
+
+# 3. Build and start everything
 docker compose up --build
 ```
 
-This builds the multi-stage image (see `Dockerfile`) and starts both containers:
+This builds the multi-stage image and starts both containers — Postgres (schema auto-applied from `sql/schema.sql`, no port published to the host) and the telemetry service (published on `http://localhost:8080`).
 
-- `db` — official `postgres:16-alpine`, schema auto-applied from `sql/schema.sql` on first start, **no port published to the host** — reachable only from `telemetry-service` over the isolated `backend` network.
-- `telemetry-service` — the compiled binary running as a non-root user, published on `http://localhost:8080`.
+**Verify it's running:**
 
 ```bash
 curl http://localhost:8080/healthz
+
 curl -X POST http://localhost:8080/api/v1/telemetry \
   -H "Content-Type: application/json" \
   -d '{"device_id":"sensor-001","timestamp":"2026-09-09T12:34:56Z","temperature":23.5,"location":{"lat":40.7128,"lon":-74.0060}}'
 ```
 
-Note: inside Docker, `DB_HOST`/`DB_PORT` are fixed to `db`/`5432` directly in `docker-compose.yml` (Docker's embedded DNS resolves the service name) — the values in `.env`/`.env.example` for those two are only used when running the binary natively outside a container.
+You should see `{"status":"ok"}` from the first call and a `201` with `{"status":"accepted",...}` from the second.
 
-## Building
-
-**Prerequisites** (system packages, not fetched by CMake):
-- A C++17 compiler (GCC 9+/Clang 10+)
-- CMake 3.16+
-- PostgreSQL client headers/library (`libpq`)
-- Standalone Asio headers (Crow's transport dependency)
+**Shut everything down:**
 
 ```bash
-# Debian/Ubuntu
-sudo apt-get install build-essential cmake libpq-dev libasio-dev
-
-# Fedora/RHEL
-sudo dnf install gcc-c++ cmake libpq-devel asio-devel
-
-# macOS (Homebrew)
-brew install cmake libpq asio
+docker compose down          # stop and remove containers
+docker compose down -v       # also wipe the Postgres data volume
 ```
 
-Crow, nlohmann/json, and libpqxx themselves are fetched and built automatically by CMake's `FetchContent`, pinned to specific tagged releases (not `master`) for reproducible builds:
+---
 
-- Crow `v1.3.4`
-- nlohmann/json `v3.12.0`
-- libpqxx `7.10.7` (the 7.x line, not 8.x — see note below)
+## Running Security Scans Locally
 
-> **Why libpqxx 7.x, not 8.x?** libpqxx 8.x requires C++20 and its headers use `std::format` (`<format>`), which needs GCC 13+. The Docker build (see `Dockerfile`) uses `debian:bookworm`, which ships GCC 12 — whose libstdc++ doesn't have `<format>` at all, so an 8.x build fails there with `fatal error: format: No such file or directory`. Staying on 7.x avoids that entirely without having to chase a newer compiler into the container; the API used here (`pqxx::params` + `exec(query, params)`) is available on 7.10.7 too.
-
-```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j"$(nproc)"
-```
-
-This produces `build/telemetry_service`.
-
-## Database setup
-
-```bash
-createdb telemetry_db
-psql telemetry_db -f sql/schema.sql
-```
-
-In production, create a dedicated least-privilege role for the service rather than using a superuser:
-
-```sql
-CREATE ROLE telemetry_app LOGIN PASSWORD '...';
-GRANT INSERT, SELECT ON telemetry_readings TO telemetry_app;
-GRANT USAGE, SELECT ON SEQUENCE telemetry_readings_id_seq TO telemetry_app;
-```
-
-## Configuration
-
-All configuration is read from environment variables — nothing is hardcoded, and the service **fails fast at startup** (before opening a listening socket) if a required variable is missing, rather than silently falling back to a default credential. See `.env.example` for the full list.
-
-```bash
-export DB_HOST=127.0.0.1
-export DB_NAME=telemetry_db
-export DB_USER=telemetry_app
-export DB_PASSWORD='...'
-# DB_PORT, DB_SSLMODE, DB_POOL_SIZE, APP_PORT are optional (see .env.example)
-
-./build/telemetry_service
-```
-
-## Security & reliability notes
-
-- **No hardcoded credentials.** `Config.hpp` reads everything from the environment and throws (causing a non-zero exit before the socket opens) if a required variable is absent.
-- **SQL injection is not possible via this endpoint.** `main.cpp` uses `pqxx::params` with `exec(query, params)` exclusively — every field from the request body is sent as a bound parameter, never concatenated into SQL. This was verified by sending a `device_id` containing `; DROP TABLE telemetry_readings;--` and confirming it was stored as inert string data.
-- **Untrusted input never reaches the DB or throws past the request boundary.** `parseTelemetryPayload()` validates every field's presence, type, and range (including basic sanity bounds on temperature/lat/lon) before anything is used to build a query, and returns a normal `std::optional` rather than throwing.
-- **Thread-safe DB access.** Crow serves requests from multiple worker threads; `pqxx::connection` is not thread-safe, so `ConnectionPool` hands each in-flight request its own connection via an RAII guard, which returns the connection to the pool automatically even if an exception is thrown mid-request.
-- **Compiler hardening.** The build enables `-Wall -Wextra -Wpedantic`, `-fstack-protector-strong`, and `_FORTIFY_SOURCE=2` in Release builds.
-- **Pinned dependencies.** All three fetched dependencies are pinned to specific release tags, not floating branches, so builds are reproducible and dependency updates are a deliberate, reviewable change.
-
-## CI security pipeline
-
-`.github/workflows/security-scan.yml` runs the same two gates as `scan.sh`, automatically, on every PR and every push to `main`: TruffleHog scans the actual commit diff for secrets, then the Docker image is built and scanned by Trivy, which fails the job on any HIGH/CRITICAL CVE. See the comments in that file for the specific reasoning behind each setting — including why the Trivy action is pinned to a commit SHA rather than a version tag (a real supply-chain incident affected nearly every tag of that action in March 2026).
-
-## Security scanning before you push
-
-`scan.sh` is a local pre-push gate: it checks that Trivy and TruffleHog are installed, scans the working directory for hardcoded secrets, builds the Docker image, and scans that image for HIGH/CRITICAL CVEs.
+`scan.sh` runs the exact same two gates as CI, before you push:
 
 ```bash
 chmod +x scan.sh   # first time only
 ./scan.sh
 ```
 
-Exit code `0` means it's safe to push. Any non-zero exit means something needs fixing first — read the `✗` line(s) it printed. See the comments in `scan.sh` for exactly what each gate checks and why.
-
-## Suggested next steps
-
-Not included here, but natural additions for this portfolio project:
-- A GitHub Actions workflow running the build plus a static analyzer (`clang-tidy`, `cppcheck`) and a dependency/SBOM scan
-- Unit tests for `parseTelemetryPayload()` (it has no framework dependencies, so it's easy to test in isolation)
-- TLS termination in front of the service (e.g. a reverse proxy) and an auth layer on the ingest endpoint
-
-Happy to build out any of these if useful.
-< testing PR trigger -->
+It checks that Trivy and TruffleHog are installed (printing install instructions if not), scans the working directory for secrets, builds the Docker image, and scans it for HIGH/CRITICAL CVEs. Exit code `0` means every gate passed. See the comments inside `scan.sh` for the reasoning behind each specific flag and threshold.
