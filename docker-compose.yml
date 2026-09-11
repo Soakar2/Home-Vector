@@ -1,0 +1,76 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    networks:
+      - backend
+    # Deliberately no `ports:` entry. The database is reachable only from
+    # other containers on the `backend` network -- never from the host
+    # machine and never from the public internet.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  telemetry-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db # service name on the `backend` network, resolved via Docker's embedded DNS
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      # Traffic to `db` never leaves this single Docker host's isolated
+      # internal network, so TLS between app and DB isn't buying much here.
+      # Override in .env (e.g. to "require") if you configure Postgres for TLS.
+      DB_SSLMODE: ${DB_SSLMODE:-disable}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      APP_PORT: 8080
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    networks:
+      - public # only network with a route to the host; carries the published port
+      - backend # only network that can reach `db`; has no route to the outside world
+    healthcheck:
+      test: ["CMD", "./healthcheck.sh"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    # Defense-in-depth beyond the minimum ask: no privilege escalation, zero
+    # Linux capabilities (this service does no raw networking or privileged
+    # binding), and a read-only root filesystem. The app itself never writes
+    # to disk; the tmpfs mount is cheap insurance for any dependency that
+    # expects a writable /tmp.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+
+networks:
+  public:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true # no default route out of this network -- containers on it can't reach the internet or be reached by it
+
+volumes:
+  db_data:

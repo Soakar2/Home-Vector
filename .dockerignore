@@ -1,0 +1,19 @@
+# Local build artifacts -- the image builds fresh from source every time
+build/
+cmake-build-*/
+
+# Version control
+.git
+.gitignore
+
+# Secrets -- never let real credentials into the build context
+.env
+
+# Docs (not needed inside the image)
+README.md
+*.md
+
+# Editor / OS cruft
+.vscode/
+.idea/
+.DS_Store

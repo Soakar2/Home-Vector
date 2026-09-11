@@ -1,0 +1,111 @@
+name: Security Scan
+
+# Runs on every PR (so bad commits are blocked before merge) and on every
+# push to main (so main itself is always re-verified, e.g. after a squash
+# merge or a direct push).
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# Least privilege: this pipeline only needs to read the repo. It doesn't
+# comment on PRs, write packages, or touch anything else.
+permissions:
+  contents: read
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      # ----------------------------------------------------------------
+      # Step 1: Checkout
+      # ----------------------------------------------------------------
+      # fetch-depth: 0 pulls full commit history, not just the latest
+      # commit. TruffleHog's secret scan (step 2) needs to diff between a
+      # base and head commit -- a shallow clone (the default) would only
+      # contain one commit and TruffleHog would have nothing to compare.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ----------------------------------------------------------------
+      # Step 2: TruffleHog -- scan for exposed secrets
+      # ----------------------------------------------------------------
+      # Split into two steps (one per trigger type) rather than one step
+      # with a single base/head expression. This isn't stylistic -- using
+      # `github.event.repository.default_branch` as base on a PUSH event
+      # resolves to the same commit as HEAD, and TruffleHog then refuses
+      # to run at all ("BASE and HEAD commits are the same"). Each event
+      # type has its own correct pair of refs:
+      #   pull_request -> the PR's base commit vs. its head commit
+      #   push         -> the commit before the push vs. the new commit
+      # Only one of these two steps actually runs on any given trigger,
+      # via the `if:` condition.
+      #
+      # extra_args: --results=verified,unknown asks for both live-verified
+      # credentials AND high-confidence matches TruffleHog couldn't
+      # actively verify (e.g. no network path to check them) -- without
+      # this, only "verified" results are reported by default, silently
+      # missing anything it can't test live. No --fail flag here: unlike
+      # the CLI (used in scan.sh), the Action step itself already fails
+      # the job when it finds reportable results.
+      - name: TruffleHog secret scan (pull request)
+        if: github.event_name == 'pull_request'
+        uses: trufflesecurity/trufflehog@main
+        with:
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          extra_args: --results=verified,unknown
+
+      - name: TruffleHog secret scan (push to main)
+        if: github.event_name == 'push'
+        uses: trufflesecurity/trufflehog@main
+        with:
+          base: ${{ github.event.before }}
+          head: ${{ github.sha }}
+          extra_args: --results=verified,unknown
+
+      # ----------------------------------------------------------------
+      # Step 3: Build the C++ application's Docker image
+      # ----------------------------------------------------------------
+      # Uses the repo's own multi-stage Dockerfile: a full Debian
+      # toolchain compiles the binary in the "builder" stage, and only
+      # the compiled binary is copied into the minimal debian:bookworm-
+      # slim "runtime" stage. Tagged with the commit SHA so this exact
+      # build is unambiguous in the scan results and logs below.
+      - name: Build Docker image
+        run: docker build -t iot-telemetry-service:${{ github.sha }} .
+
+      # ----------------------------------------------------------------
+      # Step 4: Trivy -- scan the built image, gated on HIGH/CRITICAL
+      # ----------------------------------------------------------------
+      # Pinned to a commit SHA, not a version tag -- deliberately. On
+      # 2026-03-19, a threat actor used stolen credentials to force-push
+      # 76 of 77 version tags of this exact action to credential-stealing
+      # malware (GHSA-69fq-xp46-6x23 / CVE-2026-33634). Tag v0.35.0 was
+      # unaffected because it was published after GitHub's immutable-
+      # releases protection was enabled for this repo, and its commit is
+      # independently confirmed here. Pinning to that exact commit means
+      # this workflow can't be silently repointed at a malicious version
+      # even if a tag were compromised again in the future.
+      #
+      # severity: only HIGH/CRITICAL are reported and gated on here --
+      # LOW/MEDIUM findings still exist in the image but don't affect the
+      # table below or the exit code.
+      # exit-code: '1' turns "found something at that severity" into a
+      # failed step (and therefore a failed job / blocked PR). Trivy
+      # exits 0 regardless of findings unless this is set.
+      # ignore-unfixed: true skips CVEs with no patch available yet, so
+      # the gate reflects "is there something actionable right now" --
+      # same reasoning as in scan.sh, kept consistent across both.
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          scan-type: image
+          image-ref: iot-telemetry-service:${{ github.sha }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
